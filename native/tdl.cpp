@@ -1,5 +1,4 @@
 #include <libtorrent/add_torrent_params.hpp>
-#include <libtorrent/alert_types.hpp>
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/posix_disk_io.hpp>
 #include <libtorrent/session.hpp>
@@ -15,6 +14,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace lt = libtorrent;
 
@@ -39,78 +39,115 @@ static std::string trim(const std::string& s) {
   return s.substr(start, end - start + 1);
 }
 
-static void drawProgress(const lt::torrent_status& s) {
-  const int width = 30;
+static std::string fitName(const std::string& name, size_t width) {
+  if (name.size() <= width) return name + std::string(width - name.size(), ' ');
+  size_t cut = width - 3;
+  while (cut > 0 && (static_cast<unsigned char>(name[cut]) & 0xC0) == 0x80) cut--;
+  return name.substr(0, cut) + "..." + std::string(width - 3 - cut, ' ');
+}
+
+static std::string progressLine(const lt::torrent_status& s, int elapsedSeconds) {
+  char line[256];
+  if (s.errc) {
+    std::snprintf(line, sizeof(line), "%s Error: %s", fitName(s.name.empty() ? "Unknown" : s.name, 28).c_str(),
+                  s.errc.message().c_str());
+    return line;
+  }
+  if (!s.has_metadata) {
+    std::snprintf(line, sizeof(line), "%s Finding peers... %d found, %ds", fitName("Waiting for details", 28).c_str(),
+                  s.num_peers, elapsedSeconds);
+    return line;
+  }
+  const int width = 20;
   int filled = static_cast<int>(s.progress * width + 0.5f);
   std::string bar;
   for (int i = 0; i < width; i++) bar += i < filled ? "█" : "░";
-  std::printf("\r%s %5.1f%%  %s/s  %d peers   ", bar.c_str(), s.progress * 100,
-              formatBytes(s.download_payload_rate).c_str(), s.num_peers);
-  std::fflush(stdout);
+  if (s.is_finished) {
+    std::snprintf(line, sizeof(line), "%s %s 100.0%%  Done", fitName(s.name, 28).c_str(), bar.c_str());
+    return line;
+  }
+  std::snprintf(line, sizeof(line), "%s %s %5.1f%%  %s/s  %d peers", fitName(s.name, 28).c_str(), bar.c_str(),
+                s.progress * 100, formatBytes(s.download_payload_rate).c_str(), s.num_peers);
+  return line;
+}
+
+static std::vector<std::string> askForLinks() {
+  std::vector<std::string> links;
+  std::cout << "Paste magnet links, one per line. Press Enter on an empty line to start.\n";
+  std::string line;
+  while (std::cout << "> " << std::flush && std::getline(std::cin, line)) {
+    line = trim(line);
+    if (line.empty()) break;
+    links.push_back(line);
+  }
+  return links;
 }
 
 int main(int argc, char** argv) {
-  std::string link;
-  if (argc > 1) {
-    link = argv[1];
-  } else {
-    std::cout << "Paste magnet link: " << std::flush;
-    std::getline(std::cin, link);
-  }
-  link = trim(link);
-
-  if (link.rfind("magnet:", 0) != 0) {
-    std::cerr << "That does not look like a magnet link.\n";
-    return 1;
-  }
-
-  lt::error_code ec;
-  lt::add_torrent_params atp = lt::parse_magnet_uri(link, ec);
-  if (ec) {
-    std::cerr << "Could not read magnet link: " << ec.message() << "\n";
+  std::vector<std::string> links;
+  for (int i = 1; i < argc; i++) links.push_back(trim(argv[i]));
+  if (links.empty()) links = askForLinks();
+  if (links.empty()) {
+    std::cerr << "No magnet links given.\n";
     return 1;
   }
 
   const char* home = std::getenv("HOME");
   std::string downloadDir = std::string(home ? home : ".") + "/Downloads";
-  atp.save_path = downloadDir;
+
+  std::vector<lt::add_torrent_params> toAdd;
+  for (const std::string& link : links) {
+    if (link.rfind("magnet:", 0) != 0) {
+      std::cerr << "Skipping, not a magnet link: " << link.substr(0, 40) << "\n";
+      continue;
+    }
+    lt::error_code ec;
+    lt::add_torrent_params atp = lt::parse_magnet_uri(link, ec);
+    if (ec) {
+      std::cerr << "Skipping, could not read link: " << ec.message() << "\n";
+      continue;
+    }
+    atp.save_path = downloadDir;
+    toAdd.push_back(std::move(atp));
+  }
+  if (toAdd.empty()) return 1;
 
   std::signal(SIGINT, [](int) { stopRequested = true; });
 
   lt::settings_pack pack;
-  pack.set_int(lt::settings_pack::alert_mask, lt::alert_category::error);
+  pack.set_int(lt::settings_pack::alert_mask, lt::alert_category_t{});
   lt::session_params params(pack);
   params.disk_io_constructor = lt::posix_disk_io_constructor;
   lt::session session(std::move(params));
 
-  lt::torrent_handle handle = session.add_torrent(std::move(atp));
-  std::cout << "Finding peers...\n";
+  std::vector<lt::torrent_handle> handles;
+  for (auto& atp : toAdd) handles.push_back(session.add_torrent(std::move(atp)));
 
-  bool started = false;
-  while (!stopRequested) {
-    std::vector<lt::alert*> alerts;
-    session.pop_alerts(&alerts);
-    for (lt::alert* a : alerts) {
-      if (auto* err = lt::alert_cast<lt::torrent_error_alert>(a)) {
-        std::cerr << "\nError: " << err->message() << "\n";
-        return 1;
-      }
-    }
+  auto startTime = std::chrono::steady_clock::now();
+  bool drawnBefore = false;
+  bool allDone = false;
 
-    lt::torrent_status s = handle.status();
-    if (!started && s.has_metadata) {
-      std::cout << "Downloading: " << s.name << " (" << formatBytes(s.total_wanted) << ")\n";
-      started = true;
-    }
-    if (started) drawProgress(s);
-    if (started && s.is_finished) {
-      std::cout << "\nDone. Saved to " << downloadDir << "/" << s.name << "\n";
-      return 0;
-    }
+  while (!stopRequested && !allDone) {
+    int elapsed = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startTime).count());
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    if (drawnBefore) std::printf("\x1b[%zuA", handles.size());
+    allDone = true;
+    for (const auto& handle : handles) {
+      lt::torrent_status s = handle.status();
+      std::printf("\r\x1b[2K%s\n", progressLine(s, elapsed).c_str());
+      if (!s.is_finished && !s.errc) allDone = false;
+    }
+    std::fflush(stdout);
+    drawnBefore = true;
+
+    if (!allDone) std::this_thread::sleep_for(std::chrono::milliseconds(500));
   }
 
-  std::cout << "\nStopped.\n";
+  if (stopRequested) {
+    std::cout << "Stopped.\n";
+    return 0;
+  }
+  std::cout << "All done. Files are in " << downloadDir << "\n";
   return 0;
 }
