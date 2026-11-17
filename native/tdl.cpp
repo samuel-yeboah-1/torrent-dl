@@ -16,6 +16,9 @@
 #include <thread>
 #include <vector>
 
+#include <termios.h>
+#include <unistd.h>
+
 namespace lt = libtorrent;
 
 static std::atomic<bool> stopRequested{false};
@@ -71,11 +74,49 @@ static std::string progressLine(const lt::torrent_status& s, int elapsedSeconds)
   return line;
 }
 
+static bool readLine(std::string& out) {
+  out.clear();
+  if (!isatty(STDIN_FILENO)) return static_cast<bool>(std::getline(std::cin, out));
+
+  termios original;
+  tcgetattr(STDIN_FILENO, &original);
+  termios raw = original;
+  raw.c_lflag &= ~(ICANON | ECHO | ISIG);
+  raw.c_cc[VMIN] = 1;
+  raw.c_cc[VTIME] = 0;
+  tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+
+  bool ok = true;
+  char c;
+  while (read(STDIN_FILENO, &c, 1) == 1) {
+    if (c == '\r' || c == '\n') break;
+    if (c == 3 || (c == 4 && out.empty())) {
+      ok = false;
+      break;
+    }
+    if (c == 127 || c == 8) {
+      if (!out.empty()) {
+        while (!out.empty() && (static_cast<unsigned char>(out.back()) & 0xC0) == 0x80) out.pop_back();
+        if (!out.empty()) out.pop_back();
+        std::fputs("\b \b", stdout);
+      }
+    } else if (static_cast<unsigned char>(c) >= 32 || c == '\t') {
+      out += c;
+      std::fputc(c, stdout);
+    }
+    std::fflush(stdout);
+  }
+
+  tcsetattr(STDIN_FILENO, TCSANOW, &original);
+  std::fputc('\n', stdout);
+  return ok;
+}
+
 static std::vector<std::string> askForLinks() {
   std::vector<std::string> links;
   std::cout << "Paste magnet links, one per line. Press Enter on an empty line to start.\n";
   std::string line;
-  while (std::cout << "> " << std::flush && std::getline(std::cin, line)) {
+  while (std::cout << "> " << std::flush && readLine(line)) {
     line = trim(line);
     if (line.empty()) break;
     links.push_back(line);
